@@ -1,9 +1,10 @@
-
+##### Model specifications
 struct dnn
     model::Flux.Chain 
     opt
     lossf
 end
+
 function dnn(params::Dict)
     mdl_chain = gpu(Flux.Chain(
     Flux.Dense(params["dim_redux"], params["clf_hl_size"], relu), 
@@ -20,6 +21,13 @@ struct logistic_regression
     opt
     lossf
 end 
+
+struct DataFE
+    name::String
+    data::Array
+    factor_1::Array
+    factor_2::Array
+end
 
 struct FE_model
     net::Flux.Chain
@@ -50,6 +58,29 @@ function FE_model(params::Dict)
     lossf = mse_l2
     FE_model(net, emb_layer_1, emb_layer_2, hl1, hl2, outpl, opt, lossf)
 end 
+
+function prep_FE(data; device = gpu)
+    ## data preprocessing
+    ### remove index columns, log transform
+    n = length(data.factor_1)
+    m = length(data.factor_2)
+    values = Array{Float32,2}(undef, (1, n * m))
+    #print(size(values))
+    factor_1_index = Array{Int64,1}(undef, max(n * m, 1))
+    factor_2_index = Array{Int64,1}(undef, max(n * m, 1))
+    # d3_index = Array{Int32,1}(undef, n * m)
+    
+    for i in 1:n
+        for j in 1:m
+            index = (i - 1) * m + j 
+            values[1, index] = data.data[i, j]
+            factor_1_index[index] = i # Int
+            factor_2_index[index] = j # Int 
+            # d3_index[index] = data.d3_index[i] # Int 
+        end
+    end
+    return (device(factor_1_index), device(factor_2_index)), device(vec(values))
+end
 
 struct assoc_FE
     fe::FE_model
@@ -84,7 +115,7 @@ function AE_model(params::Dict)
     encoder = gpu(Flux.Chain(enc_hl1, enc_hl2, redux_layer))
     decoder = gpu(Flux.Chain(dec_hl1, dec_hl2, outpl))
 
-    opt = Flux.ADAM(params["lr"])
+    opt = Flux.ADAM(params["lr_ae"])
     lossf = mse_l2
     AE_model(net, encoder, decoder, outpl, opt, lossf)
 end 
@@ -94,6 +125,7 @@ struct assoc_AE
     clf::dnn
 end 
 
+###### Regularisation functions 
 function l2_penalty(model::logistic_regression)
     return sum(abs2, model.model.weight)
 end 
@@ -121,7 +153,7 @@ function l2_penalty(model::AE_model)
     return l2_sum 
 end
 
-
+####### Loss functions
 function mse_l2(model::AE_model, X, Y;weight_decay = 1e-6)
     return Flux.mse(model.net(X), Y) + l2_penalty(model) * weight_decay
 end 
@@ -136,6 +168,9 @@ end
 function crossentropy_l2(model, X, Y;weight_decay = 1e-6)
     return Flux.Losses.logitcrossentropy(model.model(X), Y) + l2_penalty(model) * weight_decay
 end 
+
+
+####### Model picker
 function build(model_params)
     # picks right confiration model for given params
     if model_params["model_type"] == "linear"
@@ -168,7 +203,7 @@ function build(model_params)
         Flux.Dense(model_params["dim_redux"], model_params["clf_hl_size"], relu), 
         Flux.Dense(model_params["clf_hl_size"], model_params["clf_hl_size"], relu), 
         Flux.Dense(model_params["clf_hl_size"], model_params["nclasses"], identity)))
-        clf_opt = Flux.ADAM(model_params["lr"])
+        clf_opt = Flux.ADAM(model_params["lr_clf"])
         clf_lossf = crossentropy_l2
         clf = dnn(clf_chain, clf_opt, clf_lossf)
         model = assoc_AE(AE, clf)
@@ -177,6 +212,7 @@ function build(model_params)
     return model 
 end
 
+###### Train loop functions
 function train!(model::AE_model, fold;nepochs = 500, batchsize = 500, wd = 1e-6)
     ## Vanilla Auto-Encoder training function 
     train_x = fold["train_x"]';
@@ -195,14 +231,19 @@ function train!(model::AE_model, fold;nepochs = 500, batchsize = 500, wd = 1e-6)
         # println(my_cor(vec(X_), vec(model.net(X_))))
     end
 end 
-function train!(model::assoc_AE, fold; nepochs = 1000, batchsize=500, wd = 1e-6)
+function train!(model::assoc_AE, fold, dump_cb, params)
     ## Associative Auto-Encoder + Classifier NN model training function 
     ## Vanilla Auto-Encoder training function 
+    batchsize = params["mb_size"]
+    nepochs= params["nepochs"]
+    wd = params["wd"]
     train_x = fold["train_x"]';
     train_y = fold["train_y"]';
     nsamples = size(train_y)[2]
     nminibatches = Int(floor(nsamples/ batchsize))
     learning_curve = []
+    params["tr_acc"] = accuracy(gpu(train_y), model.clf.model(gpu(train_x)))
+    dump_cb(model, params, 0, fold)
     for iter in ProgressBar(1:nepochs)
         cursor = (iter -1)  % nminibatches + 1
         mb_ids = collect((cursor -1) * batchsize + 1: min(cursor * batchsize, nsamples))
@@ -224,7 +265,9 @@ function train!(model::assoc_AE, fold; nepochs = 1000, batchsize=500, wd = 1e-6)
         Flux.update!(model.clf.opt, ps, gs)
         clf_acc = accuracy(Y_, model.clf.model(X_))
         push!(learning_curve, (ae_loss, ae_cor, clf_loss, clf_acc))
+        params["tr_acc"] = accuracy(gpu(train_y), model.clf.model(gpu(train_x)))
         # save model (bson) every epoch if specified 
+        dump_cb(model, params, iter, fold)
         #println("$iter\t AE-loss: $ae_loss\t AE-cor: $ae_cor\t CLF-loss: $clf_loss\t CLF-acc: $clf_acc")
     end
     return learning_curve
@@ -302,6 +345,7 @@ function train!(model::logistic_regression, fold; batchsize = 500, nepochs = 100
     end 
     return accuracy(train_y, model.model(train_x))
 end 
+####### Inference functions
 function test(model::assoc_AE, fold)
     test_x = gpu(fold["test_x"]');
     test_y = gpu(fold["test_y"]');
@@ -323,6 +367,30 @@ function test(model::assoc_FE, fold)
     test_y = gpu(fold["test_y"]');
     return cpu(test_y), cpu(model.clf.model(test_x)) 
 end
+
+
+##### Validation functions 
+
+function label_binarizer(labels::Array)
+    lbls = unique(labels)
+    n = length(labels)
+    m = length(lbls)
+    binarizer = Array{Bool, 2}(undef, (n, m))
+    for s in 1:n
+        binarizer[s,:] = lbls .== labels[s]
+    end 
+    return binarizer
+end 
+
+
+function accuracy(model, X, Y)
+    n = size(X)[2]
+    preds = model(X) .== maximum(model(X), dims = 1)
+    acc = Y .& preds
+    pct = sum(acc) / n
+    return pct
+end 
+
 function accuracy(true_labs, pred_labs)
     n = size(true_labs)[2]
     preds = pred_labs .== maximum(pred_labs, dims = 1)
@@ -330,12 +398,57 @@ function accuracy(true_labs, pred_labs)
     pct = sum(acc) / n
     return pct
 end 
+
+function my_cor(X::AbstractVector, Y::AbstractVector)
+    sigma_X = std(X)
+    sigma_Y = std(Y)
+    mean_X = mean(X)
+    mean_Y = mean(Y)
+    cov = sum((X .- mean_X) .* (Y .- mean_Y)) / length(X)
+    return cov / sigma_X / sigma_Y
+end 
+
+function split_train_test(X::Matrix, targets; nfolds = 5)
+    folds = Array{Dict, 1}(undef, nfolds)
+    nsamples = size(X)[1]
+    fold_size  = Int(floor(nsamples / nfolds))
+    ids = collect(1:nsamples)
+    shuffled_ids = shuffle(ids)
+    for i in 1:nfolds 
+        tst_ids = shuffled_ids[collect((i-1) * fold_size +1: min(nsamples, i * fold_size))]
+        tr_ids = setdiff(ids, tst_ids)
+        train_x = X[tr_ids,:]
+        train_y = targets[tr_ids, :]
+        test_x = X[tst_ids, :]
+        test_y = targets[tst_ids, :]
+        folds[i] = Dict("foldn" => i, "train_x"=> train_x, "train_ids"=>tr_ids, "train_y" =>train_y,"test_x"=> test_x, "test_ids" =>tst_ids,"test_y" => test_y )
+    end
+    return folds  
+end
+
+function bootstrap(acc_function, tlabs, plabs; bootstrapn = 1000)
+    nsamples = sum([size(tbl)[2] for tbl in tlabs])
+    tlabsm = hcat(tlabs...);
+    plabsm = hcat(plabs...);
+    accs = []
+    for i in 1:bootstrapn
+        sample = rand(1:nsamples, nsamples);
+        push!(accs, acc_function(tlabsm[:,sample], plabsm[:,sample]))
+    end 
+    sorted_accs = sort(accs)
+
+    low_ci, med, upp_ci = sorted_accs[Int(round(bootstrapn * 0.025))], median(sorted_accs), sorted_accs[Int(round(bootstrapn * 0.975))]
+    return low_ci, med, upp_ci
+end 
  
+####### cross validation loops 
 function validate(model_params, cancer_data::GDC_data; nfolds = 10)
     X = cancer_data.data
     targets = label_binarizer(cancer_data.targets)
     ## performs cross-validation with model on cancer data 
     folds = split_train_test(X, targets, nfolds = nfolds)
+    # dump ids
+
     true_labs_list, pred_labs_list = [],[]
     for (foldn, fold) in enumerate(folds)
         model = build(model_params)
@@ -364,17 +477,14 @@ function validate(model_params, cancer_data::GDC_data; nfolds = 10)
     return ret_dict
 end 
 
-function bootstrap(acc_function, tlabs, plabs; bootstrapn = 1000)
-    nsamples = sum([size(tbl)[2] for tbl in tlabs])
-    tlabsm = hcat(tlabs...);
-    plabsm = hcat(plabs...);
-    accs = []
-    for i in 1:bootstrapn
-        sample = rand(1:nsamples, nsamples);
-        push!(accs, acc_function(tlabsm[:,sample], plabsm[:,sample]))
-    end 
-    sorted_accs = sort(accs)
-
-    low_ci, med, upp_ci = sorted_accs[Int(round(bootstrapn * 0.025))], median(sorted_accs), sorted_accs[Int(round(bootstrapn * 0.975))]
-    return low_ci, med, upp_ci
-end 
+######### Fit transform functions
+function fit_transform!(model::assoc_AE, Data::GDC_data, params::Dict)
+    #### trains a model following params dict on given Data 
+    #### returns data transformation using AE
+    #### rerurns accuracy metrics  
+    X = Data.data
+    targets = label_binarizer(Data.targets)
+    train_data = Dict("train_x"=>X, "train_y"=>targets)
+    learning_curves = train!(model, train_data, nepochs = params["nepochs"])
+    return model.clf.model(gpu(X')), learning_curves
+end  

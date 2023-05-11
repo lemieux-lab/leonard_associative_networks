@@ -1,6 +1,6 @@
 # module Init
 using Pkg
-Pkg.activate("/u/sauves/leonard_leucegene_factorized_embeddings/")
+Pkg.activate(".")
 
 # imports  
 using CSV
@@ -16,10 +16,12 @@ using Dates
 using AlgebraOfGraphics
 using JuBox
 using CUDA
+using SHA
+using BSON 
 
 function set_dirs()
     session_id = "$(now())"
-    outpath = "./RES/EMBEDDINGS/$session_id"
+    outpath = "./RES/$session_id"
     mkdir(outpath)
 
     return outpath, session_id
