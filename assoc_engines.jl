@@ -239,38 +239,48 @@ function train!(model::assoc_AE, fold, dump_cb, params)
     wd = params["wd"]
     train_x = fold["train_x"]';
     train_y = fold["train_y"]';
+    train_x_gpu = gpu(train_x)
+    train_y_gpu = gpu(train_y)
     nsamples = size(train_y)[2]
     nminibatches = Int(floor(nsamples/ batchsize))
+    # dump init state
     learning_curve = []
+    ae_loss = model.ae.lossf(model.ae, gpu(train_x), gpu(train_x), weight_decay = wd)
+    #ae_cor = my_cor(vec(train_x), cpu(vec(model.ae.net(gpu(train_x)))))
+    ae_cor = my_cor(vec(train_x), cpu(vec(model.ae.net(gpu(train_x)))))
+    clf_loss = model.clf.lossf(model.clf, gpu(train_x), gpu(train_y), weight_decay = wd)
+    clf_acc = accuracy(gpu(train_y), model.clf.model(gpu(train_x)))
+    push!(learning_curve, (ae_loss, ae_cor, clf_loss, clf_acc))
     params["tr_acc"] = accuracy(gpu(train_y), model.clf.model(gpu(train_x)))
-    dump_cb(model, params, 0, fold)
+    dump_cb(model, learning_curve, params, 0, fold)
     for iter in ProgressBar(1:nepochs)
         cursor = (iter -1)  % nminibatches + 1
         mb_ids = collect((cursor -1) * batchsize + 1: min(cursor * batchsize, nsamples))
         X_, Y_ = gpu(train_x[:,mb_ids]), gpu(train_y[:,mb_ids])
         ## gradient Auto-Encoder 
-        ae_loss = model.ae.lossf(model.ae, X_, X_, weight_decay = wd)
         ps = Flux.params(model.ae.net)
         gs = gradient(ps) do
             model.ae.lossf(model.ae, X_, X_, weight_decay = wd)
         end
         Flux.update!(model.ae.opt, ps, gs)
-        ae_cor = my_cor(vec(X_), vec(model.ae.net(X_)))
         ## gradient Classifier
-        clf_loss = model.clf.lossf(model.clf, X_, Y_, weight_decay = wd)
         ps = Flux.params(model.clf.model)
         gs = gradient(ps) do
             model.clf.lossf(model.clf, X_, Y_, weight_decay = wd)
         end
         Flux.update!(model.clf.opt, ps, gs)
+        ae_loss = model.ae.lossf(model.ae, X_, X_, weight_decay = wd)
+        #ae_cor = my_cor(vec(train_x), cpu(vec(model.ae.net(gpu(train_x)))))
+        ae_cor =  my_cor(vec(X_), vec(model.ae.net(gpu(X_))))
+        clf_loss = model.clf.lossf(model.clf, X_, Y_, weight_decay = wd)
         clf_acc = accuracy(Y_, model.clf.model(X_))
+        params["tr_acc"] = accuracy(train_y_gpu, model.clf.model(train_x_gpu))
         push!(learning_curve, (ae_loss, ae_cor, clf_loss, clf_acc))
-        params["tr_acc"] = accuracy(gpu(train_y), model.clf.model(gpu(train_x)))
         # save model (bson) every epoch if specified 
-        dump_cb(model, params, iter, fold)
+        dump_cb(model, learning_curve, params, iter, fold)
         #println("$iter\t AE-loss: $ae_loss\t AE-cor: $ae_cor\t CLF-loss: $clf_loss\t CLF-acc: $clf_acc")
     end
-    return learning_curve
+    return params["tr_acc"]
 end 
 
 function train!(model::assoc_FE, fold; nepochs = 1000, batchsize=500, wd = 1e-6)
@@ -440,7 +450,26 @@ function bootstrap(acc_function, tlabs, plabs; bootstrapn = 1000)
     low_ci, med, upp_ci = sorted_accs[Int(round(bootstrapn * 0.025))], median(sorted_accs), sorted_accs[Int(round(bootstrapn * 0.975))]
     return low_ci, med, upp_ci
 end 
+####### CAllback functions
+# define dump call back 
+function dump_model_cb(dump_freq, targets)
+    return (model, tr_metrics, params, iter::Int, fold) -> begin 
+        # check if end of epoch / start / end 
+        if iter % dump_freq == 0 || iter == 0 || iter == params["nepochs"]
+            # saves model
+            bson("RES/$(params["session_id"])/$(params["modelid"])/FOLD$(zpad(fold["foldn"],pad =3))/model_$(zpad(iter)).bson", Dict("model"=>model))
+            # plot learning curve
+            lr_fig_outpath = "RES/$(params["session_id"])/$(params["modelid"])/FOLD$(zpad(fold["foldn"],pad=3))_lr.svg"
+            plot_learning_curves(tr_metrics, params, lr_fig_outpath)
+            # plot embedding
+            X_tr = cpu(model.ae.encoder(gpu(fold["train_x"]')))
+            labels = tcga_abbrv(targets[fold["train_ids"]])
+            emb_fig_outpath = "RES/$(params["session_id"])/$(params["modelid"])/FOLD$(zpad(fold["foldn"],pad=3))/model_$(zpad(iter)).png"
+            plot_embed(X_tr, labels, params, emb_fig_outpath)
  
+        end 
+    end 
+end 
 ####### cross validation loops 
 function validate(model_params, cancer_data::GDC_data; nfolds = 10)
     X = cancer_data.data
@@ -458,10 +487,6 @@ function validate(model_params, cancer_data::GDC_data; nfolds = 10)
         push!(pred_labs_list, pred_labs)
         println("train: ", train_metrics)
         println("test: ", accuracy(true_labs, pred_labs))
-        # post run 
-        # save model
-        # save 2d embed svg
-        # training curves svg, csv 
     end
     ### bootstrap results get 95% conf. interval 
     low_ci, med, upp_ci = bootstrap(accuracy, true_labs_list, pred_labs_list) 
