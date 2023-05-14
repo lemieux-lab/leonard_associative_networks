@@ -21,50 +21,15 @@ assoc_ae_params = Dict("modelid" => "$(bytes2hex(sha256("$(now())"))[1:Int(floor
 
 dump_cb_dev = dump_model_cb(Int(floor(assoc_ae_params["nsamples"] / assoc_ae_params["mb_size"])), tcga_prediction.targets)
 
-function validate!(params, Data, dump_cb)
-    # init 
-    mkdir("RES/$(params["session_id"])/$(params["modelid"])")
-    # init results lists 
-    true_labs_list, pred_labs_list = [],[]
-    # create fold directories
-    [mkdir("RES/$(params["session_id"])/$(params["modelid"])/FOLD$(zpad(foldn,pad =3))") for foldn in 1:params["nfolds"]]
-    # splitting, dumped 
-    folds = split_train_test(Data.data, label_binarizer(Data.targets), nfolds = params["nfolds"])
-    dump_folds(folds, params, Data.rows)
-    # dump params
-    bson("RES/$(params["session_id"])/$(params["modelid"])/params.bson", params)
 
-    # start crossval
-    for (foldn, fold) in enumerate(folds)
-        model = build(params)
-        train_metrics = train!(model, fold, dump_cb, params)
-        true_labs, pred_labs = test(model, fold)
-        push!(true_labs_list, true_labs)
-        push!(pred_labs_list, pred_labs)
-        println("train: ", train_metrics)
-        println("test: ", accuracy(true_labs, pred_labs))
-        # post run 
-        # save model
-        # save 2d embed svg
-        # training curves svg, csv 
-    end
-    ### bootstrap results get 95% conf. interval 
-    low_ci, med, upp_ci = bootstrap(accuracy, true_labs_list, pred_labs_list) 
-    ### returns a dict 
-    ret_dict = Dict("cv_acc_low_ci" => low_ci,
-    "cv_acc_upp_ci" => upp_ci,
-    "cv_acc_median" => med
-    )
-    model_params["cv_acc_low_ci"] = low_ci
-    model_params["cv_acc_median"] = med
-    model_params["cv_acc_upp_ci"] = upp_ci
-    # param dict 
-    return ret_dict
+brca_mtae_params = Dict("modelid" => "$(bytes2hex(sha256("$(now())"))[1:Int(floor(end/3))])", "dataset" => "brca_prediction", 
+"model_type" => "assoc_ae", "session_id" => session_id, "nsamples" => length(brca_prediction.rows),
+"insize" => length(brca_prediction.cols), "ngenes" => length(brca_prediction.cols), "nclasses"=> length(unique(brca_prediction.targets)), 
+"nfolds" => 5,  "nepochs" => 5_000, "mb_size" => 50, "lr_ae" => 1e-5, "lr_clf" => 1e-4,  "wd" => 1e-3, "dim_redux" => 2, "enc_nb_hl" => 2, 
+"enc_hl_size" => 25, "dec_nb_hl" => 2, "dec_hl_size" => 25, "clf_nb_hl" => 2, "clf_hl_size"=> 25)
 
-
-end 
-
-validate!(assoc_ae_params, tcga_prediction, dump_cb_dev)
+validate!(brca_mtae_params, brca_prediction, dummy_dump_cb)
+# validate!(assoc_ae_params, tcga_prediction, dump_cb_dev)
 
 ### dimensionality reductions 
 model = build(assoc_ae_params)

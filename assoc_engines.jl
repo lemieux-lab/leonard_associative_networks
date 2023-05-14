@@ -452,7 +452,7 @@ function bootstrap(acc_function, tlabs, plabs; bootstrapn = 1000)
 end 
 ####### CAllback functions
 # define dump call back 
-function dump_model_cb(dump_freq, targets)
+function dump_model_cb(dump_freq, labels)
     return (model, tr_metrics, params, iter::Int, fold) -> begin 
         # check if end of epoch / start / end 
         if iter % dump_freq == 0 || iter == 0 || iter == params["nepochs"]
@@ -463,14 +463,61 @@ function dump_model_cb(dump_freq, targets)
             plot_learning_curves(tr_metrics, params, lr_fig_outpath)
             # plot embedding
             X_tr = cpu(model.ae.encoder(gpu(fold["train_x"]')))
-            labels = tcga_abbrv(targets[fold["train_ids"]])
+            infos = labels[fold["train_ids"]]
             emb_fig_outpath = "RES/$(params["session_id"])/$(params["modelid"])/FOLD$(zpad(fold["foldn"],pad=3))/model_$(zpad(iter)).png"
-            plot_embed(X_tr, labels, params, emb_fig_outpath)
+            plot_embed(X_tr, infos, params, emb_fig_outpath)
  
         end 
     end 
 end 
+
+function dummy_dump_cb(model, tr_metrics, params, iter::Int, fold) end 
+
 ####### cross validation loops 
+
+function validate!(params, Data, dump_cb)
+    # init 
+    mkdir("RES/$(params["session_id"])/$(params["modelid"])")
+    # init results lists 
+    true_labs_list, pred_labs_list = [],[]
+    # create fold directories
+    [mkdir("RES/$(params["session_id"])/$(params["modelid"])/FOLD$(zpad(foldn,pad =3))") for foldn in 1:params["nfolds"]]
+    # splitting, dumped 
+    folds = split_train_test(Data.data, label_binarizer(Data.targets), nfolds = params["nfolds"])
+    dump_folds(folds, params, Data.rows)
+    # dump params
+    bson("RES/$(params["session_id"])/$(params["modelid"])/params.bson", params)
+
+    # start crossval
+    for (foldn, fold) in enumerate(folds)
+        model = build(params)
+        train_metrics = train!(model, fold, dump_cb, params)
+        true_labs, pred_labs = test(model, fold)
+        push!(true_labs_list, true_labs)
+        push!(pred_labs_list, pred_labs)
+        println("train: ", train_metrics)
+        println("test: ", accuracy(true_labs, pred_labs))
+        # post run 
+        # save model
+        # save 2d embed svg
+        # training curves svg, csv 
+    end
+    ### bootstrap results get 95% conf. interval 
+    low_ci, med, upp_ci = bootstrap(accuracy, true_labs_list, pred_labs_list) 
+    ### returns a dict 
+    ret_dict = Dict("cv_acc_low_ci" => low_ci,
+    "cv_acc_upp_ci" => upp_ci,
+    "cv_acc_median" => med
+    )
+    params["cv_acc_low_ci"] = low_ci
+    params["cv_acc_median"] = med
+    params["cv_acc_upp_ci"] = upp_ci
+    # param dict 
+    return ret_dict
+
+
+end 
+
 function validate(model_params, cancer_data::GDC_data; nfolds = 10)
     X = cancer_data.data
     targets = label_binarizer(cancer_data.targets)
